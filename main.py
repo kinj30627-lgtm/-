@@ -10,7 +10,7 @@ from telegram.ext import (
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = {123456789}  # 네 텔레그램 숫자 ID로 바꿔
+ADMIN_IDS = {8521145131}  # 네 텔레그램 숫자 ID로 바꿔
 
 DB_PATH = "promo.db"
 
