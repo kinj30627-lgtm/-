@@ -1,172 +1,226 @@
 import os
-import sqlite3
+import json
+import random
+from collections import Counter
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8715955198:AAFg_ik2I9IwbKBFK1en71e4Hsb7WRMQZEo").strip()
-DB_PATH = "promo.db"
+DATA_FILE = "baccarat_data.json"
+START_BALANCE = 100000
+CHAT_BONUS_CHANCE = 0.05
+CHAT_BONUS_AMOUNT = 50000
 
-raw_admin_ids = os.getenv("ADMIN_IDS", "8521145131")
-ADMIN_IDS = {
-    int(x.strip()) for x in raw_admin_ids.split(",")
-    if x.strip().isdigit()
+
+SUITS = ["♠", "♥", "♦", "♣"]
+RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+CARD_VALUES = {
+    "A": 1,
+    "2": 2,
+    "3": 3,
+    "4": 4,
+    "5": 5,
+    "6": 6,
+    "7": 7,
+    "8": 8,
+    "9": 9,
+    "10": 0,
+    "J": 0,
+    "Q": 0,
+    "K": 0,
 }
 
 
-def is_admin(user_id: int | None) -> bool:
-    return user_id in ADMIN_IDS if user_id is not None else False
+def create_shoe():
+    shoe = []
+    for _ in range(8):  # 8덱
+        for suit in SUITS:
+            for rank in RANKS:
+                shoe.append({"rank": rank, "suit": suit})
+    random.shuffle(shoe)
+    return shoe
 
 
-def get_conn():
-    return sqlite3.connect(DB_PATH)
+def load_data():
+    if not Path(DATA_FILE).exists():
+        return {
+            "users": {},
+            "bets": {},
+            "history": [],
+            "shoe": create_shoe(),
+        }
+
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS target_chats (
-            chat_id TEXT PRIMARY KEY,
-            title TEXT
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def save_post(text: str) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO posts (text) VALUES (?)", (text,))
-    conn.commit()
-    post_id = cur.lastrowid
-    conn.close()
-    return post_id
+def ensure_user(data, user):
+    user_id = str(user.id)
+    if user_id not in data["users"]:
+        data["users"][user_id] = {
+            "name": user.full_name,
+            "balance": START_BALANCE,
+            "wins": 0,
+            "losses": 0,
+            "ties": 0,
+            "chat_bonus_count": 0,
+        }
+    else:
+        data["users"][user_id]["name"] = user.full_name
+    return user_id
 
 
-def get_posts():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, text FROM posts ORDER BY id DESC")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def draw_card(data):
+    if len(data["shoe"]) < 20:
+        data["shoe"] = create_shoe()
+
+    return data["shoe"].pop()
 
 
-def get_post(post_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, text FROM posts WHERE id = ?", (post_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+def card_to_text(card):
+    return f"{card['rank']}{card['suit']}"
 
 
-def delete_post(post_id: int) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM posts WHERE id = ?", (post_id,))
-    conn.commit()
-    deleted = cur.rowcount
-    conn.close()
-    return deleted
+def baccarat_value(cards):
+    total = sum(CARD_VALUES[c["rank"]] for c in cards) % 10
+    return total
 
 
-def add_target_chat(chat_id: str, title: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO target_chats (chat_id, title) VALUES (?, ?)",
-        (chat_id, title)
+def third_card_value(card):
+    if not card:
+        return None
+    return CARD_VALUES[card["rank"]]
+
+
+def play_baccarat_round(data):
+    player = [draw_card(data), draw_card(data)]
+    banker = [draw_card(data), draw_card(data)]
+
+    p_total = baccarat_value(player)
+    b_total = baccarat_value(banker)
+
+    # 내추럴
+    if p_total in [8, 9] or b_total in [8, 9]:
+        return finalize_round(player, banker)
+
+    player_third = None
+
+    # 플레이어 3장 규칙
+    if p_total <= 5:
+        player_third = draw_card(data)
+        player.append(player_third)
+
+    p_total = baccarat_value(player)
+    b_total = baccarat_value(banker)
+
+    # 뱅커 3장 규칙
+    if player_third is None:
+        if b_total <= 5:
+            banker.append(draw_card(data))
+    else:
+        ptv = third_card_value(player_third)
+        if b_total <= 2:
+            banker.append(draw_card(data))
+        elif b_total == 3 and ptv != 8:
+            banker.append(draw_card(data))
+        elif b_total == 4 and ptv in [2, 3, 4, 5, 6, 7]:
+            banker.append(draw_card(data))
+        elif b_total == 5 and ptv in [4, 5, 6, 7]:
+            banker.append(draw_card(data))
+        elif b_total == 6 and ptv in [6, 7]:
+            banker.append(draw_card(data))
+
+    return finalize_round(player, banker)
+
+
+def finalize_round(player, banker):
+    p_total = baccarat_value(player)
+    b_total = baccarat_value(banker)
+
+    if p_total > b_total:
+        winner = "p"
+        label = "플레이어"
+    elif b_total > p_total:
+        winner = "b"
+        label = "뱅커"
+    else:
+        winner = "t"
+        label = "타이"
+
+    return {
+        "player_cards": player,
+        "banker_cards": banker,
+        "player_total": p_total,
+        "banker_total": b_total,
+        "winner": winner,
+        "winner_label": label,
+    }
+
+
+def payout_amount(side, amount):
+    if side == "p":
+        return int(amount * 2.0)
+    if side == "b":
+        return int(amount * 1.95)
+    if side == "t":
+        return int(amount * 8.0)
+    return 0
+
+
+def side_label(side):
+    return {"p": "플레이어", "b": "뱅커", "t": "타이"}.get(side, "알수없음")
+
+
+def result_text(round_data):
+    p_cards = " ".join(card_to_text(c) for c in round_data["player_cards"])
+    b_cards = " ".join(card_to_text(c) for c in round_data["banker_cards"])
+
+    return (
+        f"🎴 결과 공개\n\n"
+        f"플레이어: {p_cards}\n"
+        f"합계: {round_data['player_total']}\n\n"
+        f"뱅커: {b_cards}\n"
+        f"합계: {round_data['banker_total']}\n\n"
+        f"승리: {round_data['winner_label']}"
     )
-    conn.commit()
-    conn.close()
-
-
-def remove_target_chat(chat_id: str) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM target_chats WHERE chat_id = ?", (chat_id,))
-    conn.commit()
-    deleted = cur.rowcount
-    conn.close()
-    return deleted
-
-
-def get_target_chats():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT chat_id, title FROM target_chats ORDER BY title ASC")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_first_post():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, text FROM posts ORDER BY id ASC LIMIT 1")
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-async def send_post_to_chat(context: ContextTypes.DEFAULT_TYPE, post_id: int, chat_id: str):
-    row = get_post(post_id)
-    if not row:
-        raise ValueError("존재하지 않는 글ID")
-
-    _, text = row
-    await context.bot.send_message(chat_id=chat_id, text=text)
-
-
-async def scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
-    if context.bot_data.get("paused"):
-        return
-
-    post = get_first_post()
-    if not post:
-        return
-
-    post_id, text = post
-    targets = get_target_chats()
-
-    for chat_id, _title in targets:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        except Exception as e:
-            print(f"[scheduled_broadcast] send fail {chat_id}: {e}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        return
+    data = load_data()
+    ensure_user(data, update.effective_user)
+    save_data(data)
 
     await update.message.reply_text(
-        "사용 가능 명령어:\n"
-        "/addpost 내용\n"
-        "/listposts\n"
-        "/deletepost 글ID\n"
-        "/now 글ID\n"
-        "/enablepromo\n"
-        "/disablepromo\n"
-        "/listtargets\n"
-        "/pause\n"
-        "/resume\n"
-        "/help"
+        "🎰 데모 바카라 봇\n\n"
+        "기본 포인트: 100000\n"
+        "채팅 시 5% 확률로 50000 포인트 지급\n\n"
+        "명령어:\n"
+        "/balance - 내 포인트\n"
+        "/bet p 금액 - 플레이어 베팅\n"
+        "/bet b 금액 - 뱅커 베팅\n"
+        "/bet t 금액 - 타이 베팅\n"
+        "/draw - 결과 공개\n"
+        "/history - 최근 결과\n"
+        "/shoe - 남은 카드 수\n"
+        "/rank - 랭킹\n"
+        "/help - 도움말"
     )
 
 
@@ -174,161 +228,190 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 
-async def addpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user_id = ensure_user(data, update.effective_user)
+    save_data(data)
+
+    bal = data["users"][user_id]["balance"]
+    await update.message.reply_text(f"💰 현재 포인트: {bal:,}")
+
+
+async def bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user_id = ensure_user(data, update.effective_user)
+
+    if len(context.args) != 2:
+        await update.message.reply_text("형식: /bet p 10000  또는 /bet b 10000  또는 /bet t 5000")
         return
 
-    text = update.message.text.replace("/addpost", "", 1).strip()
-
-    if not text:
-        await update.message.reply_text("형식:\n/addpost 홍보할내용")
-        return
-
-    post_id = save_post(text)
-    await update.message.reply_text(f"저장 완료: 글 ID {post_id}")
-
-
-async def listposts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        return
-
-    rows = get_posts()
-    if not rows:
-        await update.message.reply_text("저장된 홍보글 없음")
-        return
-
-    chunks = []
-    for post_id, text in rows:
-        preview = text[:120]
-        chunks.append(f"[{post_id}]\n{preview}")
-
-    msg = "\n\n".join(chunks)
-    await update.message.reply_text(msg[:4000])
-
-
-async def deletepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        return
-
-    if not context.args:
-        await update.message.reply_text("/deletepost 글ID")
+    side = context.args[0].lower().strip()
+    if side not in ["p", "b", "t"]:
+        await update.message.reply_text("베팅 방향은 p, b, t 중 하나여야 해.")
         return
 
     try:
-        post_id = int(context.args[0])
+        amount = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("글ID는 숫자여야 함")
+        await update.message.reply_text("금액은 숫자로 입력해.")
         return
 
-    deleted = delete_post(post_id)
-    if deleted:
-        await update.message.reply_text("삭제 완료")
+    if amount <= 0:
+        await update.message.reply_text("금액은 1 이상이어야 해.")
+        return
+
+    balance_now = data["users"][user_id]["balance"]
+    if amount > balance_now:
+        await update.message.reply_text(f"포인트 부족. 현재 잔액: {balance_now:,}")
+        return
+
+    data["users"][user_id]["balance"] -= amount
+    data["bets"][user_id] = {
+        "side": side,
+        "amount": amount,
+        "name": update.effective_user.full_name,
+    }
+    save_data(data)
+
+    await update.message.reply_text(
+        f"✅ 베팅 완료\n"
+        f"선택: {side_label(side)}\n"
+        f"금액: {amount:,}\n"
+        f"남은 포인트: {data['users'][user_id]['balance']:,}"
+    )
+
+
+async def draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+
+    if not data["bets"]:
+        await update.message.reply_text("현재 베팅이 없어. 먼저 /bet 명령어로 베팅해.")
+        return
+
+    round_data = play_baccarat_round(data)
+    winner = round_data["winner"]
+
+    lines = [result_text(round_data), "", "📋 정산 결과"]
+
+    for user_id, bet_info in list(data["bets"].items()):
+        if user_id not in data["users"]:
+            continue
+
+        amount = bet_info["amount"]
+        side = bet_info["side"]
+        name = bet_info["name"]
+
+        if side == winner:
+            reward = payout_amount(side, amount)
+            data["users"][user_id]["balance"] += reward
+            data["users"][user_id]["wins"] += 1
+            profit = reward - amount
+            lines.append(f"✅ {name}: 적중 (+{profit:,}) / 현재 {data['users'][user_id]['balance']:,}")
+        else:
+            data["users"][user_id]["losses"] += 1
+            if winner == "t":
+                data["users"][user_id]["ties"] += 1
+            lines.append(f"❌ {name}: 미적중 (-{amount:,}) / 현재 {data['users'][user_id]['balance']:,}")
+
+    data["history"].append(
+        {
+            "winner": round_data["winner"],
+            "winner_label": round_data["winner_label"],
+            "player_total": round_data["player_total"],
+            "banker_total": round_data["banker_total"],
+        }
+    )
+    data["history"] = data["history"][-20:]
+    data["bets"] = {}
+    save_data(data)
+
+    await update.message.reply_text("\n".join(lines)[:4096])
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    hist = data["history"][-10:]
+
+    if not hist:
+        await update.message.reply_text("최근 결과가 없어.")
+        return
+
+    text = ["🕘 최근 결과"]
+    for i, item in enumerate(reversed(hist), start=1):
+        text.append(
+            f"{i}. {item['winner_label']} "
+            f"(플 {item['player_total']} : 뱅 {item['banker_total']})"
+        )
+
+    await update.message.reply_text("\n".join(text))
+
+
+async def shoe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    remain = len(data["shoe"])
+
+    counter = Counter(card["rank"] for card in data["shoe"])
+    text = [f"🃏 남은 카드 수: {remain}장", ""]
+    text.append("남은 랭크 분포:")
+    for rank in RANKS:
+        text.append(f"{rank}: {counter.get(rank, 0)}")
+
+    await update.message.reply_text("\n".join(text)[:4096])
+
+
+async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    users = list(data["users"].values())
+
+    if not users:
+        await update.message.reply_text("랭킹 데이터가 없어.")
+        return
+
+    users.sort(key=lambda x: x["balance"], reverse=True)
+
+    lines = ["🏆 포인트 랭킹"]
+    for i, user in enumerate(users[:10], start=1):
+        lines.append(f"{i}. {user['name']} - {user['balance']:,}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def on_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message or update.message.text.startswith("/"):
+        return
+
+    data = load_data()
+    user_id = ensure_user(data, update.effective_user)
+
+    if random.random() < CHAT_BONUS_CHANCE:
+        data["users"][user_id]["balance"] += CHAT_BONUS_AMOUNT
+        data["users"][user_id]["chat_bonus_count"] += 1
+        save_data(data)
+
+        await update.message.reply_text(
+            f"🎁 랜덤 보너스!\n"
+            f"{CHAT_BONUS_AMOUNT:,} 포인트 지급\n"
+            f"현재 포인트: {data['users'][user_id]['balance']:,}"
+        )
     else:
-        await update.message.reply_text("해당 글ID 없음")
-
-
-async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        return
-
-    if not context.args:
-        await update.message.reply_text("/now 글ID")
-        return
-
-    try:
-        post_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("글ID는 숫자여야 함")
-        return
-
-    chat_id = str(update.effective_chat.id)
-
-    try:
-        await send_post_to_chat(context, post_id, chat_id)
-        await update.message.reply_text("즉시 발송 완료")
-    except Exception as e:
-        await update.message.reply_text(f"발송 실패: {e}")
-
-
-async def enablepromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        return
-
-    chat = update.effective_chat
-    title = chat.title or update.effective_user.full_name or "private_chat"
-    add_target_chat(str(chat.id), title)
-
-    await update.message.reply_text("이 방을 1시간 자동홍보 대상에 등록했어요.")
-
-
-async def disablepromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        return
-
-    chat_id = str(update.effective_chat.id)
-    deleted = remove_target_chat(chat_id)
-
-    if deleted:
-        await update.message.reply_text("이 방 자동홍보 해제 완료")
-    else:
-        await update.message.reply_text("이 방은 등록되어 있지 않아요.")
-
-
-async def listtargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        return
-
-    rows = get_target_chats()
-    if not rows:
-        await update.message.reply_text("등록된 자동홍보 대상 방 없음")
-        return
-
-    msg = "\n\n".join([f"{title}\n{chat_id}" for chat_id, title in rows])
-    await update.message.reply_text(msg[:4000])
-
-
-async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        return
-
-    context.bot_data["paused"] = True
-    await update.message.reply_text("자동홍보 일시정지")
-
-
-async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        return
-
-    context.bot_data["paused"] = False
-    await update.message.reply_text("자동홍보 재개")
+        save_data(data)
 
 
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN이 비어있음")
 
-    init_db()
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("addpost", addpost))
-    app.add_handler(CommandHandler("listposts", listposts))
-    app.add_handler(CommandHandler("deletepost", deletepost_command))
-    app.add_handler(CommandHandler("now", now))
-    app.add_handler(CommandHandler("enablepromo", enablepromo))
-    app.add_handler(CommandHandler("disablepromo", disablepromo))
-    app.add_handler(CommandHandler("listtargets", listtargets))
-    app.add_handler(CommandHandler("pause", pause))
-    app.add_handler(CommandHandler("resume", resume))
-
-    app.job_queue.run_repeating(
-        scheduled_broadcast,
-        interval=3600,
-        first=10,
-        name="promo_repeat",
-    )
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("bet", bet))
+    app.add_handler(CommandHandler("draw", draw))
+    app.add_handler(CommandHandler("history", history))
+    app.add_handler(CommandHandler("shoe", shoe))
+    app.add_handler(CommandHandler("rank", rank))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_chat))
 
     app.run_polling()
 
